@@ -1,0 +1,332 @@
+// --- Global Mod Metadata ---
+const TANK_TEXTURE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAADySURBVFhH7ZQxDoMwDEVNr4G6VmJC6mk4Itdh7VpxjsBPDaKVCLZxypInIccg5zs/CVQoKAj8uHLjeETouo0HvlQcU3yJ932PIKkTceRAFH8NA6dE3IzbVogdQBOPtuVXfk5IJ8jWhKY4SxPaQvcmLEWuTUj/A1sqiEEcTQBENDWjvh3mvZtxccLiwMqvE0DrhNUBCCy1KSdAUsPiwFYcpM5ENrYWh3tdI4cT4dk0MSKPXzMSRSCuPMi14mcO4e7esv2iJqyHEGDVPCR6jyMC5luERXOfuoY7QFi8MKsDe6tXk8OBv7Ge/E96DZeKFwoOEE1wUX7TFh5zsgAAAABJRU5ErkJggg==";
+ModAPI.meta.title("BookWIZ Tank & Guns");
+ModAPI.meta.version("v5.0");
+ModAPI.meta.icon(TANK_TEXTURE);
+ModAPI.meta.description("Destructible, Drivable Warium's Tank with Rotating Turret and Muzzle Flash.");
+ModAPI.require("player");
+
+// --- Global Variables/Helpers ---
+var DamageSourceClass = ModAPI.reflect.getClassByName("DamageSource");
+const TANK_SPEED = 0.15; // Adjusted down from 0.25
+const TANK_EXPLOSION_POWER = 2.5; // Adjusted down from 4.0
+
+// Raycast helper function
+function entityRayCast(player, world, range) {
+    const HEADSHOT_MAX_DISTANCE_FROM_HEAD = 0.72;
+    var eyePosition = player.getPositionEyes(0.0);
+    var targetPosition = player.rayTrace(range, 0).hitVec;
+    var entities = world.getEntitiesWithinAABBExcludingEntity(
+        player.getRef(),
+        player.getEntityBoundingBox().expand(range, range, range).getRef()
+    ).getCorrective().array;
+    var closestEntity = null;
+    var isHeadshot = false;
+    var closestDistance = range;
+
+    for (var i = 0; i < entities.length; i++) {
+        if (!entities[i]) continue;
+        var entity = entities[i];
+        var entityBB = entity.getEntityBoundingBox().expand(0.3, 0.3, 0.3);
+        var intercept = entityBB.calculateIntercept(eyePosition.getRef(), targetPosition.getRef());
+
+        if (intercept != null) {
+            var distance = eyePosition.distanceTo(intercept.hitVec.getRef());
+            if (distance < closestDistance) {
+                closestDistance = distance;
+                closestEntity = entity;
+                isHeadshot = entity.getPositionEyes(0.0).distanceTo(intercept.hitVec.getRef()) < HEADSHOT_MAX_DISTANCE_FROM_HEAD;
+            }
+        }
+    }
+
+    if (closestEntity != null) {
+        return { entity: closestEntity, headshot: isHeadshot };
+    } else {
+        return null;
+    }
+}
+
+// ------------------------------------------------------------------
+// A. CORE TANK ENTITY LOGIC (Drivable & Destructible)
+// ------------------------------------------------------------------
+
+function DrivableTankEntity() {
+    var entityClass = ModAPI.reflect.getClassById("net.minecraft.entity.Entity");
+    var entitySuper = ModAPI.reflect.getSuper(entityClass, (x) => x.length === 1);
+    
+    var EntityBookWIZTank = function EntityBookWIZTank($world) {
+        entitySuper(this, $world);
+        this.$setSize(2.0, 1.5); 
+        this.$setEntityBoundingBox(this.getRef().$create$net$minecraft$util$AxisAlignedBB(-1.0, 0.0, -1.0, 1.0, 1.5, 1.0));
+        this.$isTank = true;
+        this.$ignoreFrustumCheck = true; 
+        this.stepHeight = 1.0; 
+        
+        // Health and Damage properties
+        this.maxHealth = 200.0; 
+        this.currentHealth = 200.0;
+        this.isInvulnerable = false;
+        
+        // Turret rotation property (Server side tracking)
+        this.turretYaw = 0.0; 
+    }
+
+    ModAPI.reflect.prototypeStack(entityClass, EntityBookWIZTank);
+    
+    EntityBookWIZTank.prototype.$getMountedYOffset = function() {
+        return 1.4;
+    }
+
+    // Damage Handler
+    EntityBookWIZTank.prototype.$attackEntityFrom = function($damageSource, $damageAmount) {
+        if (this.isInvulnerable || this.$worldObj.$isRemote || this.getRef().$isDead) {
+            return false;
+        }
+
+        var damageSource = ModAPI.util.wrap($damageSource);
+        var actualDamage = $damageAmount;
+        
+        // Custom Damage Reduction/Toughness
+        if (damageSource.isProjectile() || damageSource.isExplosion()) {
+            actualDamage *= 0.5;
+        }
+
+        this.currentHealth -= actualDamage;
+        this.$worldObj.playSoundAtEntity(this.getRef(), ModAPI.util.str("game.player.hurt"), 1.0, 1.0);
+
+        if (this.currentHealth <= 0.0) {
+            this.currentHealth = 0.0;
+            this.getRef().$setDead(); 
+            this.$worldObj.$newExplosion(null, this.posX, this.posY + 1.0, this.posZ, 4.0, true, true);
+        }
+        
+        return true;
+    };
+
+
+    EntityBookWIZTank.prototype.$interact = function ($player) {
+        var player = ModAPI.util.wrap($player);
+        if (!this.$worldObj.$isRemote && !this.getRef().$isDead && !player.$isRiding()) {
+            player.$mountEntity(this.getRef());
+            return true;
+        }
+        return false;
+    };
+
+    // Movement and Turret Synchronization
+    EntityBookWIZTank.prototype.$onUpdate = function() {
+        entitySuper.prototype.$onUpdate.call(this);
+
+        if (this.$riddenByEntity != null) {
+            var driver = ModAPI.util.wrap(this.$riddenByEntity);
+            var forward = driver.moveForward;
+            var strafe = driver.moveStrafing;
+            var driverYaw = driver.rotationYaw;
+            
+            // Sync turret yaw to driver's look direction
+            this.turretYaw = driverYaw; 
+            
+            if (forward !== 0 || strafe !== 0) {
+                // Tank body rotation follows driver's yaw
+                this.getRef().$setRotationYaw(driverYaw); 
+                
+                var xzDir = driverYaw * (Math.PI / 180.0);
+                var cos = Math.cos(xzDir);
+                var sin = Math.sin(xzDir);
+
+                // Movement is relative to the tank's body orientation
+                var velX = (forward * TANK_SPEED * -sin) + (strafe * TANK_SPEED * cos);
+                var velZ = (forward * TANK_SPEED * cos) + (strafe * TANK_SPEED * -sin);
+                
+                this.getRef().$setVelocityX(velX);
+                this.getRef().$setVelocityZ(velZ);
+            } else {
+                this.getRef().$setVelocityX(this.getRef().$getVelocityX() * 0.9);
+                this.getRef().$setVelocityZ(this.getRef().$getVelocityZ() * 0.9);
+            }
+            
+            this.$moveEntity(this.getRef().$getVelocityX(), this.getRef().$getVelocityY(), this.getRef().$getVelocityZ());
+
+            var yOffset = this.getRef().$getMountedYOffset();
+            this.$riddenByEntity.getRef().$setPosition(this.posX, this.posY + yOffset, this.posZ);
+        }
+    };
+    
+    function internal_reg() {
+        ModAPI.entityClasses["bookwiz_tank"] = EntityBookWIZTank;
+        ModAPI.entityNames[ModAPI.keygen.entity("bookwiz_tank")] = ModAPI.util.str("BookWIZTank");
+        ModAPI.entityNames[210] = ModAPI.util.str("BookWIZTank");
+        return EntityBookWIZTank;
+    }
+
+    if (ModAPI.entityClasses) {
+        return internal_reg();
+    } else {
+        ModAPI.addEventListener("bootstrap", internal_reg);
+    }
+}
+ModAPI.dedicatedServer.appendCode(DrivableTankEntity);
+var TankEntity = DrivableTankEntity();
+
+// ------------------------------------------------------------------
+// B. CANNON FIRE LOGIC (with Muzzle Flash)
+// ------------------------------------------------------------------
+ModAPI.addEventListener("net:useItem", (event) => {
+    var player = ModAPI.util.wrap(event.player);
+    var world = ModAPI.util.wrap(event.player.$worldObj);
+
+    if (!world.isRemote && player.$isRiding()) {
+        var riddenEntity = ModAPI.util.wrap(player.$ridingEntity);
+        
+        if (riddenEntity.getRef().$isTank) {
+            event.preventDefault(); 
+            
+            var cactus = DamageSourceClass.staticVariables.cactus;
+            var shotentitydata = entityRayCast(player, world, 64.0); 
+
+            // Muzzle Flash Effect (Smoke/Explosion particles)
+            // Spawn a particle at the front of the tank barrel
+            world.newParticle("largeexplode", player.posX + (player.getLookVec().$xCoord * 1.5), player.posY + 1.2, player.posZ + (player.getLookVec().$zCoord * 1.5), 0.0, 0.0, 0.0);
+            
+            // Cannon Firing Sound
+            world.playSoundAtEntity(player.getRef(), ModAPI.util.str("mob.ghast.fireball"), 4.0, 0.5);
+
+            if (shotentitydata != null) {
+                // Hitting an entity
+                shotentitydata.entity.attackEntityFrom(cactus, 30.0); // 30 damage
+                
+                // Explosion at the hit location
+                world.newExplosion(null, shotentitydata.entity.posX, shotentitydata.entity.posY, shotentitydata.entity.posZ, TANK_EXPLOSION_POWER, false, true);
+                
+            } 
+        }
+    }
+});
+
+
+// ------------------------------------------------------------------
+// C. ITEM SPAWNER LOGIC
+// ------------------------------------------------------------------
+function TankCannonItem() {
+    const TANK_TEXTURE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAADySURBVFhH7ZQxDoMwDEVNr4G6VmJC6mk4Itdh7VpxjsBPDaKVCLZxypInIccg5zs/CVQoKAj8uHLjeETouo0HvlQcU3yJ932PIKkTceRAFH8NA6dE3IzbVogdQBOPtuVXfk5IJ8jWhKY4SxPaQvcmLEWuTUj/A1sqiEEcTQBENDWjvh3mvZtxccLiwMqvE0DrhNUBCCy1KSdAUsPiwFYcpM5ENrYWh3tdI4cT4dk0MSKPXzMSRSCuPMi14mcO4e7esv2iJqyHEGDVPCR6jyMC5luERXOfuoY7QFi8MKsDe6tXk8OBv7Ge/E96DZeKFwoOEE1wUX7TFh5zsgAAAABJRU5ErkJggg==";
+    var creativeMiscTab = ModAPI.reflect.getClassById("net.minecraft.creativetab.CreativeTabs").staticVariables.tabMisc;
+    var itemClass = ModAPI.reflect.getClassById("net.minecraft.item.Item");
+    var itemSuper = ModAPI.reflect.getSuper(itemClass, (x) => x.length === 1);
+    
+    var EntityTankClass = ModAPI.entityClasses["bookwiz_tank"]; 
+    
+    var nmi_ItemTankSpawner = function nmi_ItemTankSpawner() {
+        itemSuper(this);
+        this.$setCreativeTab(creativeMiscTab);
+        this.$setMaxStackSize(1);
+    }
+
+    ModAPI.reflect.prototypeStack(itemClass, nmi_ItemTankSpawner);
+    nmi_ItemTankSpawner.prototype.$onItemRightClick = function ($itemstack, $world, $player) {
+        var world = ModAPI.util.wrap($world);
+        var entityplayer = ModAPI.util.wrap($player);
+
+        if (!world.isRemote) {
+            var tank = new EntityTankClass($world);
+            tank.getRef().$setPosition(entityplayer.posX, entityplayer.posY, entityplayer.posZ);
+            $world.$spawnEntityInWorld(tank.getRef());
+            world.playSoundAtEntity(entityplayer.getRef(), ModAPI.util.str("random.explode"), 1.0, 1.0);
+            $itemstack.$stackSize--; 
+        }
+        return $itemstack;
+    }
+
+    function internal_reg() {
+        var spawner_item = (new nmi_ItemTankSpawner()).$setUnlocalizedName(
+            ModAPI.util.str("tank_spawner")
+        ).$setMaxStackSize(1);
+        itemClass.staticMethods.registerItem.method(ModAPI.keygen.item("bookwiz_tank_spawner"), ModAPI.util.str("bookwiz_tank_spawner"), spawner_item);
+        ModAPI.items["bookwiz_tank_spawner"] = spawner_item;
+        return spawner_item;
+    }
+
+    if (ModAPI.items) {
+        return internal_reg();
+    } else {
+        ModAPI.addEventListener("bootstrap", internal_reg);
+    }
+}
+TankCannonItem(); 
+
+// ------------------------------------------------------------------
+// D. CLIENT-SIDE RENDERING (ASYNC SINK)
+// ------------------------------------------------------------------
+ModAPI.addEventListener("lib:asyncsink", async () => {
+    
+    // Camo texture
+    const CAMO_TANK_TEXTURE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAGQSURBVFhH7ZYxDoMwDEVfX5mX6UqchY8jQZJkC05gB9iBJjT5gC1h4tE4pS6D4AknJ6h7lH+fH0qLSlzIq/Wf4hT/L7n0O4iX/E4gV3yD/f13C/68H4QY/eL7/f0EofmR2A8gZg36D8QagvF8hB5Qz+kPGAiX38Sj/C8QbhP4R9/8kXvIfmI8D8XnL7gTwB2Pz9h8MhM87xUuX/jM0l9+X2QcQPX+8kXgCceX3xYv/n7j/P5H2XwH4g/F/3vEfiDce/c8/xS5/e/B9/vMfo1B9/g9f4q/7d4e/yQ/xO+EHPpD7X/X8Y/L7/Vj/Gf7vT/9rC/1/Y2H+B2o78Y89w3d9P3l/m/1/v/kX/v9A6v3n2g9QdO4c9Q+m8/vX+D8QevsO9R96/7+R/e3fH9fB/k7xH3QvU/c7hJ/Tf+Fv/x+m8X8A9X6D+Q9S/n+L/4sA20vX3xYx/v9KkPrD7i/UvP9Scn7j9t06/xVw/w7gR8j+N5D+g/0N3V+I/R/0L1R/Ifb/X+X/P6n3/Xf7+B84xS7+0L0C/zO1X1T/D3W+Y/wAAAABJRU5ErkJggg==";
+    const CAMO_TEXTURE_BUFFER = await (await fetch(CAMO_TANK_TEXTURE)).arrayBuffer();
+
+    // 1. Spawner Item Setup (Same as before)
+    AsyncSink.L10N.set("item.bookwiz_tank_spawner.name", "Warium's Tank Spawner");
+    AsyncSink.setFile("resourcepacks/AsyncSinkLib/assets/minecraft/models/item/bookwiz_tank_spawner.json", JSON.stringify(
+        {"parent": "builtin/generated", "textures": {"layer0": "items/tank_spawner"}}
+    ));
+    AsyncSink.setFile("resourcepacks/AsyncSinkLib/assets/minecraft/textures/items/bookwiz_tank_spawner.png", CAMO_TEXTURE_BUFFER);
+
+    // 2. Register the Entity for Rendering
+    ModAPI.addEventListener("lib:asyncsink:registerentities", (renderEntity) => {
+        // We use the 'keyframe' feature to specify a joint (head) that should be rotated dynamically
+        renderEntity.registerEntity(ModAPI.entityClasses["bookwiz_tank"], ModAPI.util.str("bookwiz_tank"), { keyframe: "head" });
+    });
+
+    // 3. Tank Entity Model (Modified for Turret Rotation)
+    AsyncSink.setFile("resourcepacks/AsyncSinkLib/assets/minecraft/models/entity/bookwiz_tank.json", JSON.stringify(
+        {
+            "credit": "BookWIZ Drivable Tank Model",
+            "texture_size": [64, 64], 
+            "elements": [
+                {   // **Tank Body (Chassis)**: Base part that rotates with the tank's movement
+                    "name": "body",
+                    "from": [ -8, 0, -8 ], 
+                    "to": [ 8, 8, 8 ],    
+                    "faces": {
+                        "down":  { "texture": "#all" }, "up":    { "texture": "#all" },
+                        "north": { "texture": "#all" }, "south": { "texture": "#all" },
+                        "west":  { "texture": "#all" }, "east":  { "texture": "#all" }
+                    }
+                }
+            ],
+            // 🚨 New keyframe for rotation: 'head' will be the turret base
+            "keyframes": [
+                {
+                    "name": "head",
+                    "elements": [
+                        {   // Turret Base
+                            "from": [ -4, 8, -4 ],
+                            "to": [ 4, 12, 4 ],
+                            "faces": {
+                                "down":  { "texture": "#all" }, "up":    { "texture": "#all" },
+                                "north": { "texture": "#all" }, "south": { "texture": "#all" },
+                                "west":  { "texture": "#all" }, "east":  { "texture": "#all" }
+                            }
+                        },
+                        {   // Cannon Barrel
+                            "from": [ -1, 9.5, 4 ], 
+                            "to": [ 1, 11.5, 12 ], 
+                            "faces": {
+                                "down":  { "texture": "#all" }, "up":    { "texture": "#all" },
+                                "north": { "texture": "#all" }, "south": { "texture": "#all" },
+                                "west":  { "texture": "#all" }, "east":  { "texture": "#all" }
+                            }
+                        }
+                    ],
+                    "pivot": [0, 8, 0] // Pivot point for rotation (center of the turret base)
+                }
+            ],
+            "textures": {
+                "all": "entity/bookwiz_tank_generic"
+            }
+        }
+    ));
+
+    // 4. Tank Entity Texture
+    AsyncSink.setFile("resourcepacks/AsyncSinkLib/assets/minecraft/textures/entity/bookwiz_tank_generic.png", CAMO_TEXTURE_BUFFER);
+});
+
